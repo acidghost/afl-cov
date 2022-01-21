@@ -55,6 +55,16 @@ LOG_ERRORS = 2
 CovPathsDictType = Dict[str, Union[Dict[str, str], str, int]]
 CovDictType = Dict[bytes, Dict[bytes, Dict[bytes, Dict[bytes, bytes]]]]
 
+RE_TIME = re.compile(r"time:(\d+)")
+RE_COV_LINES = re.compile(rb"^\s+(lines\.\..*:\s.*)")
+RE_COV_FUNCS = re.compile(rb"^\s+(functions\.\..*:\s.*)")
+RE_COV_BRANCHES = re.compile(rb"^\s+(branches\.\..*:\s.*)")
+RE_LCOV_SF = re.compile(rb"SF:(\S+)")
+RE_LCOV_FNDA = re.compile(rb"^FNDA:(\d+),(\S+)")
+RE_LCOV_DA = re.compile(rb"^DA:(\d+),(\d+)")
+RE_NRCOV_LINES = re.compile(rb"lines\.\..*: (\d+\.\d+)% \((\d+) of (\d+) lines")
+RE_NRCOV_BRANCHES = re.compile(rb"branches\.\..*: (\d+\.\d+)% \((\d+) of (\d+) branches")
+
 
 def main():
     exit_success = 0
@@ -119,6 +129,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
     run_once = False
     tot_files = 0
     curr_cycle = -1
+    curr_time = prev_time = 0
 
     afl_files = []  # type: List[str]
     cov_paths = {}  # type: CovPathsDictType
@@ -141,7 +152,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
         last_dir = False
 
         do_coverage = True
-        if cargs.cover_corpus:
+        if cargs.cover_corpus or cargs.cover_frequency_ms > 0:
             do_coverage = False
 
         for fuzz_dir in cov_paths["dirs"]:
@@ -175,10 +186,36 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                 if f_ctr == len(new_files):
                     last_file = True
 
+                if cargs.cover_frequency_ms > 0:
+                    do_coverage = False
+
                 if cargs.cover_corpus and last_dir and last_file:
                     # in --cover-corpus mode, only run lcov after all AFL
                     # test cases have been processed
                     do_coverage = True
+
+                curr_time = get_time_from_test(f)
+                if curr_time is not None:
+                    if cargs.cover_frequency_ms > 0 and (
+                        (prev_time == 0 and curr_time > 0)
+                        or (curr_time - prev_time >= cargs.cover_frequency_ms)
+                    ):
+                        # TODO: we should do coverage logging at the last time:0 test
+                        logr(
+                            b"[+] Enough time has passed: %d" % (curr_time - prev_time),
+                            cov_paths["log_file"],
+                            cargs,
+                        )
+                        do_coverage = True
+                elif cargs.cover_frequency_ms > 0:
+                    logr(
+                        b"[-] Cannot get time from test: expected '%s' to contain pattern 'time:NNN'"
+                        % os.path.basename(f).encode(),
+                        cov_paths["log_file"],
+                        cargs,
+                    )
+                    rv = False
+                    break
 
                 out_lines = []  # type: List[bytes]
                 curr_cycle = get_cycle_num(num_files, cargs)
@@ -242,7 +279,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                 if do_coverage and not cargs.coverage_at_exit:
 
                     # generate the code coverage stats for this test case
-                    lcov_gen_coverage(cov_paths, cargs)
+                    lcov_gen_coverage(curr_time, cov_paths, cargs)
 
                     # diff to the previous code coverage, look for new
                     # lines/functions, and write out results
@@ -267,6 +304,8 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                         for line in out_lines:
                             logr(b"    %s" % line, cov_paths["log_file"], cargs)
                         logr(b"++++++ END\n", cov_paths["log_file"], cargs)
+
+                    prev_time = curr_time if curr_time is not None else 0
 
                 cov_paths["id_file"] = "%s" % os.path.basename(f)
 
@@ -315,7 +354,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
 
         if cargs.coverage_at_exit:
             # generate the code coverage stats for this test case
-            lcov_gen_coverage(cov_paths, cargs)
+            lcov_gen_coverage(curr_time, cov_paths, cargs)
 
             # diff to the previous code coverage, look for new
             # lines/functions, and write out results
@@ -326,7 +365,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
         write_pos_cov(cov[b"pos"], cov_paths, cargs)
 
         if not cargs.disable_lcov_web:
-            lcov_gen_coverage(cov_paths, cargs)
+            lcov_gen_coverage(curr_time, cov_paths, cargs)
             gen_web_cov_report(cov_paths, cargs)
 
     else:
@@ -340,6 +379,11 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
 
     return rv
 
+def get_time_from_test(fname) -> Optional[int]:
+    time_match = RE_TIME.search(fname)
+    if time_match and time_match.group(1):
+        return int(time_match.group(1))
+    return None
 
 def id_range_update(afl_file: str, cov_paths: CovPathsDictType) -> None:
     id_val = int(os.path.basename(afl_file).split(",")[0].split(":")[1])
@@ -555,14 +599,14 @@ def extract_coverage(
         for line in f:
             line = line.strip()
 
-            m = re.search(rb"SF:(\S+)", line)
+            m = RE_LCOV_SF.search(line)
             if m and m.group(1):
                 current_file = m.group(1)
                 cov_init(current_file, tmp_cov)
                 continue
 
             if current_file:
-                m = re.search(rb"^FNDA:(\d+),(\S+)", line)
+                m = RE_LCOV_FNDA.search(line)
                 if m and m.group(2):
                     fcn = m.group(2) + b"()"
                     if m.group(1) == b"0":
@@ -573,7 +617,7 @@ def extract_coverage(
                     continue
 
                 # look for lines that were never called
-                m = re.search(rb"^DA:(\d+),(\d+)", line)
+                m = RE_LCOV_DA.search(line)
                 if m and m.group(1):
                     lnum = m.group(1)
                     if m.group(2) == b"0":
@@ -672,7 +716,8 @@ def get_cycle_num(id_num: int, cargs: argparse.Namespace) -> int:
     return cycle_num
 
 
-def lcov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace):
+def lcov_gen_coverage(curr_time: Optional[int], cov_paths: CovPathsDictType,
+                      cargs: argparse.Namespace):
 
     lcov_opts = ""
     if cargs.enable_branch_coverage:
@@ -747,29 +792,51 @@ def lcov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace):
         if os.path.exists(tmp_file.name):
             os.unlink(tmp_file.name)
 
-    log_coverage(out_lines, cov_paths["log_file"], cargs)
+    log_coverage(out_lines, curr_time, cov_paths["csv_cov"], cov_paths["log_file"], cargs)
 
     return
 
 
-def log_coverage(out_lines: List[bytes], log_file, cargs: argparse.Namespace):
+def log_coverage(out_lines: List[bytes], curr_time: Optional[int], csv_cov,
+                 log_file, cargs: argparse.Namespace):
+    EMPTY = (None, None)
+    cov_lines = cov_branches = EMPTY
+
     for line in out_lines:
-        m = re.search(rb"^\s+(lines\.\..*:\s.*)", line)
+        m = RE_COV_LINES.search(line)
         if m and m.group(1):
             logr(b"    " + m.group(1), log_file, cargs)
+            if curr_time is not None:
+                m = RE_NRCOV_LINES.search(line)
+                assert m and m.group(1) and m.group(2)
+                cov_lines = (m.group(1), m.group(2))
         else:
-            m = re.search(rb"^\s+(functions\.\..*:\s.*)", line)
+            m = RE_COV_FUNCS.search(line)
             if m and m.group(1):
                 logr(b"    " + m.group(1), log_file, cargs)
             else:
                 if cargs.enable_branch_coverage:
-                    m = re.search(rb"^\s+(branches\.\..*:\s.*)", line)
+                    m = RE_COV_BRANCHES.search(line)
                     if m and m.group(1):
                         logr(
                             b"    " + m.group(1),
                             log_file,
                             cargs,
                         )
+                        if curr_time is not None:
+                            m = RE_NRCOV_BRANCHES.search(line)
+                            assert m and m.group(1) and m.group(2)
+                            cov_branches = (m.group(1), m.group(2))
+
+    if curr_time is not None:
+        assert cov_lines != EMPTY
+        with open(csv_cov, "ab") as f:
+            f.write(b"%d,%s,%s" % (curr_time, *cov_lines))
+            if cargs.enable_branch_coverage:
+                assert cov_branches != EMPTY
+                f.write(b",%s,%s" % cov_branches)
+            f.write(b"\n")
+
     return
 
 
@@ -951,6 +1018,7 @@ def init_tracking(cov_paths: CovPathsDictType, cargs: argparse.Namespace) -> boo
     cov_paths["id_delta_cov"] = "%s/id-delta-cov" % cov_paths["top_dir"]
     cov_paths["zero_cov"] = "%s/zero-cov" % cov_paths["top_dir"]
     cov_paths["pos_cov"] = "%s/pos-cov" % cov_paths["top_dir"]
+    cov_paths["csv_cov"] = "%s/coverage.csv" % cov_paths["top_dir"]
     cov_paths["diff"] = ""
     cov_paths["id_file"] = ""
     cov_paths["id_min"] = -1  # used in --cover-corpus mode
@@ -1012,6 +1080,12 @@ def init_tracking(cov_paths: CovPathsDictType, cargs: argparse.Namespace) -> boo
             False,
             "",
         )
+
+    with open(cov_paths["csv_cov"], "w") as f:
+        f.write("time,lines_per,lines_abs")
+        if cargs.enable_branch_coverage:
+            f.write(",branches_per,branches_abs")
+        f.write("\n")
 
     return True
 
@@ -1413,6 +1487,12 @@ def parse_cmdline() -> argparse.Namespace:
         action="store_true",
         help="Measure coverage after running all available tests instead of individually per queue file",
         default=False,
+    )
+    p.add_argument(
+        "--cover-frequency-ms",
+        type=int,
+        help="Measure coverage for tests found every given interval in milliseconds",
+        default=0,
     )
     p.add_argument(
         "--coverage-at-exit",
